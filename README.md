@@ -1,9 +1,10 @@
 # Energy-Charts-Data-Engineering-Challenge
 
-This project implements a local Bronze → Silver → Gold data pipeline using PySpark and Delta Lake.  
-The pipeline ingests electricity production and price data from the Energy-Charts API, stores it as Delta tables, and prepares it for analytics.
+This project implements a local Bronze → Silver → Gold data pipeline using PySpark and Delta Lake.
 
-The goal of this project is to demonstrate a reproducible data engineering workflow with proper storage, structure, and safe reruns, as required by the technical challenge.
+The pipeline ingests daily electricity production and price data from the Energy-Charts public API, stores raw data safely, transforms it into structured event-level tables, and finally produces daily analytical aggregates.
+
+The objective is to demonstrate a reproducible, idempotent data engineering workflow that can be run locally end-to-end.
 
 
 ## Challenge description
@@ -12,8 +13,9 @@ The challenge was to build a small data pipeline that:
 
 - fetches daily energy data from a public API,
 - stores it reliably,
-- organizes it step by step for analysis,
-- and can be run locally by anyone.
+- transforms it step-by-step into structured datasets,
+- produces analytics-ready outputs,
+- supports safe reruns and backfilling.
 
 ## Data source
 
@@ -21,56 +23,100 @@ Data is fetched from the public **Energy-Charts API**:
 
 - Base URL: `https://api.energy-charts.info`
 - Endpoints used:
-  - `public_power` — electricity production
-  - `price` — electricity price
+  - `public_power`  electricity production by energy source
+  - `price`  electricity market price
 
-The pipeline fetches data one day at a time, which enables:
-- backfilling historical data,
-- safe reruns,
-- reproducible results.
+Data is fetched day by day, which enables:
+- historical backfilling,
+- partial reruns,
+- deterministic and reproducible results.
 
 ## Architecture: Bronze -> Silver -> Gold
 
 This project follows the medallion architecture, a standard pattern in data engineering.
 
-### Bronze layer (raw data)
+### Bronze layer (raw ingestion)
+Purpose: 
+- Stores the raw API response exactly as received.
+- Preserves original JSON for future reprocessing.
+- Guarantee safe reruns.
 
-- Stores the raw API response as JSON.
-- No transformation or cleaning is applied.
-- Preserves the original source data exactly as received.
+Implementation:
+- One record per day per dataset
+- Raw JSON stored as a string
+- Partitioned by day
+- Idempotent: existing data for a given day is deleted before insertion
+
 
 Tables:
 - `data/bronze/public_power`
 - `data/bronze/price`
 
 Schema:
-- `raw_json`
-- `ingestion_ts`
-- `day`
-- `dataset`
+- `raw_json` raw API response (string)
+- `ingestion_ts` ingestion timestamp
+- `day` ingestion date (YYYY-MM-DD)
+- `dataset` dataset name
 
 
-### Silver layer (cleaned / structured)
+### Silver layer (Structured event data)
+Purpose:
+- Parse raw JSON
+- Normalize time-series data
+- Produce event-level, analytics-ready rows
 
-- Reads data from the Bronze layer.
-- Currently keeps a minimal structure (`day`, `ingestion_ts`, `raw_json`).
-- Designed to be extended later with JSON parsing and normalization.
+#### Public Power (Silver)
+- Parses production types and time series
+- Explodes timestamps and values
+- Produces one row per:
+    - timestamp
+    - production type
+    - power value
 
-Tables:
+Table:
 - `data/silver/public_power`
+
+Schema:
+- `day` 
+- `timestamp`
+- `production_type` 
+- `power_mw` 
+- `ingestion_ts` 
+
+#### Price (Silver)
+- Parses price time series
+- Explodes timestamps and prices
+- Produces one row per timestamp
+
+Table:
 - `data/silver/price`
+Schema:
+- `day` 
+- `timestamp`
+- `price_eur_mwh` 
+- `ingestion_ts` 
 
 
-### Gold layer (analytics-ready)
+### Gold layer (Daily aggregates)
+Purpose:
+- Provide analytics-ready daily summaries
+- Validate the full pipeline end-to-end
 
-- Produces a final output validating the end-to-end pipeline.
-- Currently implemented as a metadata table (`gold/meta`).
-- Intended to host daily aggregates and analytical results in future iterations.
+#### Daily public power:
+Aggregates total daily energy production per energy source.
 
 Tables:
-- `data/gold/meta`
+- `data/gold/daily_public_power`
 
-All tables are stored as Delta Lake tables, identified by the presence of a `_delta_log/` directory.
+Metrics:
+ `daily_net_power_mwh` sum of power values per day and production type.
+
+#### Daily electricity price
+Computes the average daily electricity price.
+Table:
+- `data/gold/daily_price`
+Metrics:
+- `avg_price_eur_mwh` daily average price
 
 ## Project structure
 
@@ -113,46 +159,48 @@ To execute the pipeline run :
 python3 main.py
 ```
 This command will:
-- fetch daily energy production and price data from the API,
-- store raw data in Bronze Delta tables,
-- create Silver tables,
-- generate a Gold output validating the end-to-end flow.
+- Fetch daily power production and price data from the Energy-Charts API
+- Store raw JSON data in Bronze Delta tables
+- Transform raw data into Silver event-level tables
+- Build Gold daily aggregates
+- Stop Spark cleanly after completion
 
-(The date range and parameters can be adjusted directly in `main.py`.)
+The date range, country, and price zone can be adjusted directly in `main.py`.
 
 ## Idempotency and safe reruns
 The pipeline is designed to be safe to rerun.
 
-Before inserting data for a given day:
-- existing records for that day are deleted from the Bronze Delta table,
-- fresh data is then inserted.
+For each day:
+- Existing records for that day are deleted from Bronze
+- Fresh data is then inserted
 
 This guarantees:
-
-- no duplicate records,
-- reliable backfilling,
-- reproducible results.
-
-This behavior is essential for real-world data pipelines.
+- no duplicate records
+- reliable backfilling
+- deterministic results
+This behavior mirrors real-world production pipelines.
 
 ## Validation
-After running the pipeline, Delta Lake transaction logs are created:
+After a successful run, each Delta table contains a `_delta_log` directory:
 ```text
 data/bronze/public_power/_delta_log
 data/bronze/price/_delta_log
 data/silver/public_power/_delta_log
 data/silver/price/_delta_log
-data/gold/meta/_delta_log
+data/gold/daily_public_power/_delta_log
+data/gold/daily_price/_delta_log
 ```
-The presence of _delta_log confirms that the data is stored as Delta Lake tables.
+The presence of `_delta_log` confirms correct Delta Lake storage and transaction tracking.
 
 ## Design decisions
 - Delta Lake was chosen for reliable storage, versioning, and safe overwrites.
-- Bronze stores raw JSON to allow reprocessing if schemas change.
-- Silver and Gold are intentionally simple placeholders to validate the pipeline structure before adding complex analytics.
+- Bronze stores raw JSON to allow reprocessing if API schemas change.
+- Silver normalizes time-series data into event-level rows.
+- Gold focuses on daily aggregates to validate analytical readiness
+- Pipeline runs locally in `local[*]` mode for simplicity and portability
 
 ## Assumptions and limitations
 
-- The pipeline runs locally using Spark in `local[*]` mode.
-- Silver transformations currently keep raw JSON.
-- Gold output is a validation artifact rather than a full analytical dataset.
+- Designed for local execution (not distributed cluster deployment)
+- No orchestration tool (Airflow, Dagster) — single-script execution
+- Aggregations are intentionally simple to demonstrate structure rather than advanced analytics
