@@ -8,9 +8,19 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from delta.tables import DeltaTable
 
+"""
+Energy-Charts pipeline (local):
+Bronze (raw JSON) -> Silver (lightly structured) -> Gold (basic aggregate / meta)
+
+- Ingestes data day-by-day from https://api.energy-charts.info
+- Stores outputs as Delta Lake tables
+- Safe reruns (idempotent) by deleting existing day before inserting
+"""
 
 DELTA_VERSION = "4.0.1"
-IVY_DIR = "/Users/kenzacharfi/.ivy2_spark"
+IVY_DIR = os.path.join(os.getcwd(), ".ivy2_spark")
+os.makedirs(IVY_DIR, exist_ok=True)
+
 
 BRONZE_DIR = "data/bronze"
 SILVER_DIR = "data/silver"
@@ -33,33 +43,29 @@ def create_spark() -> SparkSession:
     )
     spark.sparkContext.setLogLevel("WARN")
     return spark
+
 ### Helpers
-# Date generator: run the pipeline day-by-day
-def daterange(start: date, end: date):
+
+def daterange(start: date, end: date): # Yield all dates from start to end
     d = start
     while d <= end:
         yield d
         d += timedelta(days=1)
 
-#Download JSON from the API
-def fetch_json(endpoint: str, params: dict) -> dict:
+
+def fetch_json(endpoint: str, params: dict) -> dict: #Download JSON from the the Energy-Charts API
     r = requests.get(f"{BASE_URL}/{endpoint}", params=params, timeout=60)
     r.raise_for_status()
     return r.json()
 
-#Write a Delta table
-def write_delta(df, path: str, mode: str = "append", partition_by: Optional[str] = None):
+def write_delta(df, path: str, mode: str = "append", partition_by: Optional[str] = None): #Write dataframe as a Delta table
     writer = df.write.format("delta").mode(mode)
     if partition_by:
         writer = writer.partitionBy(partition_by)
     writer.save(path)
 
-#Idempotency helper: delete one day if it already exists
-def delete_day_if_exists(spark: SparkSession, table_path: str, day_str: str):
-    """
-    Idempotency: if the Delta table exists, delete rows for this day before writing.
-    Uses DeltaTable API (works even when SQL 'delta.`path`' is not supported).
-    """
+
+def delete_day_if_exists(spark: SparkSession, table_path: str, day_str: str): #Idempotency helper: delete one day if it already exists
     if os.path.exists(os.path.join(table_path, "_delta_log")):
         dt = DeltaTable.forPath(spark, table_path)
         dt.delete(F.col("day") == day_str)
@@ -67,8 +73,8 @@ def delete_day_if_exists(spark: SparkSession, table_path: str, day_str: str):
 
 
 ### Bronze ingestion (raw data layer)
-#Ingest public power (raw)
-def ingest_power_bronze(spark: SparkSession, day: date, country: str = "de"):
+
+def ingest_power_bronze(spark: SparkSession, day: date, country: str = "de"): #Ingest public power (raw)
     data = fetch_json("public_power", {"country": country, "date": day.isoformat()})
 
     raw = (
@@ -83,8 +89,8 @@ def ingest_power_bronze(spark: SparkSession, day: date, country: str = "de"):
 
     write_delta(raw, table_path, mode="append", partition_by="day")
 
-#Ingest price (raw)
-def ingest_price_bronze(spark: SparkSession, day: date, zone: str = "DE-LU"):
+
+def ingest_price_bronze(spark: SparkSession, day: date, zone: str = "DE-LU"): #Ingest price (raw)
     data = fetch_json("price", {"bzn": zone, "date": day.isoformat()})
 
     raw = (
@@ -101,19 +107,19 @@ def ingest_price_bronze(spark: SparkSession, day: date, zone: str = "DE-LU"):
 
 ### Silver (placeholder for now)
 
-#Public power -> silver
-def bronze_to_silver_public_power(spark: SparkSession):
+
+def bronze_to_silver_public_power(spark: SparkSession): #Public power -> silver
     bronze = spark.read.format("delta").load(os.path.join(BRONZE_DIR, "public_power"))
     silver = bronze.select("day", "ingestion_ts", "raw_json")
     write_delta(silver, os.path.join(SILVER_DIR, "public_power"), mode="overwrite")
 
-#Price -> silver
-def bronze_to_silver_price(spark: SparkSession):
+
+def bronze_to_silver_price(spark: SparkSession): #Price -> silver
     bronze = spark.read.format("delta").load(os.path.join(BRONZE_DIR, "price"))
     silver = bronze.select("day", "ingestion_ts", "raw_json")
     write_delta(silver, os.path.join(SILVER_DIR, "price"), mode="overwrite")
 
-### Gold (placeholder meta)
+### Gold (meta table)
 def silver_to_gold(spark: SparkSession):
     silver_power = spark.read.format("delta").load(os.path.join(SILVER_DIR, "public_power"))
     silver_price = spark.read.format("delta").load(os.path.join(SILVER_DIR, "price"))
@@ -129,7 +135,7 @@ def silver_to_gold(spark: SparkSession):
 
 ### Orchestration
 def run(start: str, end: str, country: str = "de", zone: str = "DE-LU"):
-    print(" PIPELINE RUNNING: bronze → silver → gold")
+    print(" PIPELINE RUNNING: bronze -> silver -> gold")
     print("start:", start, "end:", end, "country:", country, "zone:", zone)
 
     spark = create_spark()
