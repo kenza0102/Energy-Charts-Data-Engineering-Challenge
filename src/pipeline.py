@@ -108,30 +108,161 @@ def ingest_price_bronze(spark: SparkSession, day: date, zone: str = "DE-LU"): #I
 ### Silver (placeholder for now)
 
 
-def bronze_to_silver_public_power(spark: SparkSession): #Public power -> silver
-    bronze = spark.read.format("delta").load(os.path.join(BRONZE_DIR, "public_power"))
-    silver = bronze.select("day", "ingestion_ts", "raw_json")
-    write_delta(silver, os.path.join(SILVER_DIR, "public_power"), mode="overwrite")
+def bronze_to_silver_public_power(spark: SparkSession):
+    bronze = spark.read.format("delta").load(
+        os.path.join(BRONZE_DIR, "public_power")
+    )
+
+    # Parse raw JSON
+    parsed = bronze.withColumn(
+        "json",
+        F.from_json(
+            "raw_json",
+            """
+            STRUCT<
+              unix_seconds: ARRAY<LONG>,
+              production_types: ARRAY<
+                STRUCT<
+                  name: STRING,
+                  data: ARRAY<DOUBLE>
+                >
+              >
+            >
+            """
+        )
+    )
+
+    # Explode production types
+    exploded_types = parsed.withColumn(
+        "production_type",
+        F.explode("json.production_types")
+    )
+
+    # Zip timestamps with values
+    zipped = exploded_types.withColumn(
+        "ts_value_pairs",
+        F.arrays_zip(
+            "json.unix_seconds",
+            "production_type.data"
+        )
+    )
+
+    # Explode timestamp-value pairs
+    exploded_rows = zipped.withColumn(
+        "ts_value",
+        F.explode("ts_value_pairs")
+    )
+
+    silver = exploded_rows.select(
+        F.col("day"),
+        F.to_timestamp(F.col("ts_value.unix_seconds")).alias("timestamp"),
+        F.col("production_type.name").alias("production_type"),
+        F.col("ts_value.data").alias("power_mw"),
+        F.col("ingestion_ts")
+    )
+
+    write_delta(
+        silver,
+        os.path.join(SILVER_DIR, "public_power"),
+        mode="overwrite",
+        partition_by="day"
+    )
 
 
-def bronze_to_silver_price(spark: SparkSession): #Price -> silver
-    bronze = spark.read.format("delta").load(os.path.join(BRONZE_DIR, "price"))
-    silver = bronze.select("day", "ingestion_ts", "raw_json")
-    write_delta(silver, os.path.join(SILVER_DIR, "price"), mode="overwrite")
+def bronze_to_silver_price(spark: SparkSession):
+    bronze = spark.read.format("delta").load(
+        os.path.join(BRONZE_DIR, "price")
+    )
+
+    # Parse raw JSON
+    parsed = bronze.withColumn(
+        "json",
+        F.from_json(
+            "raw_json",
+            """
+            STRUCT<
+              unix_seconds: ARRAY<LONG>,
+              price: ARRAY<DOUBLE>
+            >
+            """
+        )
+    )
+
+    # Zip timestamps with prices
+    zipped = parsed.withColumn(
+        "ts_price_pairs",
+        F.arrays_zip(
+            "json.unix_seconds",
+            "json.price"
+        )
+    )
+
+    # Explode into event-level rows
+    exploded = zipped.withColumn(
+        "ts_price",
+        F.explode("ts_price_pairs")
+    )
+
+    silver = exploded.select(
+        F.col("day"),
+        F.to_timestamp(F.col("ts_price.unix_seconds")).alias("timestamp"),
+        F.col("ts_price.price").alias("price_eur_mwh"),
+        F.col("ingestion_ts")
+    )
+
+    write_delta(
+        silver,
+        os.path.join(SILVER_DIR, "price"),
+        mode="overwrite",
+        partition_by="day"
+    )
 
 ### Gold (meta table)
 def silver_to_gold(spark: SparkSession):
-    silver_power = spark.read.format("delta").load(os.path.join(SILVER_DIR, "public_power"))
-    silver_price = spark.read.format("delta").load(os.path.join(SILVER_DIR, "price"))
+    silver_power = spark.read.format("delta").load(
+        os.path.join(SILVER_DIR, "public_power")
+    )
+    silver_price = spark.read.format("delta").load(
+        os.path.join(SILVER_DIR, "price")
+    )
 
-    gold_meta = (
-        silver_power.groupBy()
-        .agg(F.count("*").alias("power_rows"))
-        .crossJoin(silver_price.groupBy().agg(F.count("*").alias("price_rows")))
+    # ----------------------------
+    # Gold: daily public power
+    # ----------------------------
+    gold_daily_power = (
+        silver_power
+        .groupBy("day", "production_type")
+        .agg(
+            F.sum("power_mw").alias("daily_net_power_mwh")
+        )
         .withColumn("built_ts", F.current_timestamp())
     )
 
-    write_delta(gold_meta, os.path.join(GOLD_DIR, "meta"), mode="overwrite")
+    # ----------------------------
+    # Gold: daily price
+    # ----------------------------
+    gold_daily_price = (
+        silver_price
+        .groupBy("day")
+        .agg(
+            F.avg("price_eur_mwh").alias("avg_price_eur_mwh")
+        )
+        .withColumn("built_ts", F.current_timestamp())
+    )
+
+    write_delta(
+        gold_daily_power,
+        os.path.join(GOLD_DIR, "daily_public_power"),
+        mode="overwrite",
+        partition_by="day"
+    )
+
+    write_delta(
+        gold_daily_price,
+        os.path.join(GOLD_DIR, "daily_price"),
+        mode="overwrite",
+        partition_by="day"
+    )
 
 ### Orchestration
 def run(start: str, end: str, country: str = "de", zone: str = "DE-LU"):
